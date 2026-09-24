@@ -1,24 +1,13 @@
 #requires -version 5.1
 <#
 .SYNOPSIS
-    Windows Profile Maintenance Utility - Phase 2.2
+    Windows Profile Maintenance Utility - Phase 3.1
 
 .DESCRIPTION
-    Read-only profile analysis and cleanup intelligence with Dry Run.
-    NO FILES ARE DELETED OR MODIFIED in this phase.
-
-    Includes:
-      - Profile discovery and size calculation
-      - Protected profile classification
-      - Hierarchical profile analysis
-      - Cleanup candidate detection
-      - Cleanup policy/risk classification
-      - Dry-run cleanup report
-      - JSON export of the latest analysis
-      - Logging
+    Profile analysis, selective library/desktop purging, Quick Access/Favorites reset, and active cleanup engine.
 
 .NOTES
-    Version: 2.2.0
+    Version: 3.1.0
     Run as Administrator.
 #>
 
@@ -29,7 +18,7 @@ $ErrorActionPreference = 'Stop'
 # GLOBALS
 # ============================================================
 
-$ScriptVersion = '2.2.0'
+$ScriptVersion = '3.1.0'
 $ScriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $LogDirectory = Join-Path $ScriptRoot 'Logs'
 $ExportDirectory = Join-Path $ScriptRoot 'Reports'
@@ -47,139 +36,123 @@ $LogFile = Join-Path $LogDirectory (
 $script:LastAnalysis = $null
 
 # ============================================================
-# LOGGING
+# UTILITY HELPERS
 # ============================================================
+
+function Format-HumanSize {
+    param([int64]$Bytes)
+
+    if ($Bytes -ge 1GB) { return ('{0:N2} GB' -f ($Bytes / 1GB)) }
+    elseif ($Bytes -ge 1MB) { return ('{0:N2} MB' -f ($Bytes / 1MB)) }
+    elseif ($Bytes -ge 1KB) { return ('{0:N2} KB' -f ($Bytes / 1KB)) }
+    else { return ('{0} Bytes' -f $Bytes) }
+}
 
 function Write-Log {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Message,
-
-        [ValidateSet('INFO','SUCCESS','WARNING','ERROR','SECURITY')]
-        [string]$Level = 'INFO'
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet('INFO','SUCCESS','WARNING','ERROR','SECURITY')][string]$Level = 'INFO'
     )
 
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
     $line = '[{0}] [{1}] {2}' -f $timestamp, $Level, $Message
 
-    try {
-        Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8
-    }
-    catch {
-        # Logging failure must never terminate the utility.
-    }
+    try { Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8 } catch {}
 }
-
-# ============================================================
-# ADMINISTRATOR CHECK
-# ============================================================
 
 function Test-IsAdministrator {
     try {
         $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
         $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-
-        return $principal.IsInRole(
-            [Security.Principal.WindowsBuiltInRole]::Administrator
-        )
+        return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     }
-    catch {
-        return $false
-    }
+    catch { return $false }
 }
 
 if (-not (Test-IsAdministrator)) {
-    Write-Host ''
     Write-Host 'ERROR: This utility must be run as Administrator.' -ForegroundColor Red
-    Write-Host ''
-    Write-Host 'Right-click PowerShell and select "Run as administrator".'
-    Write-Host ''
     exit 1
 }
 
-# ============================================================
-# SID / ACCOUNT RESOLUTION
-# ============================================================
-
 function Resolve-SidToAccountName {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$SID
-    )
-
+    param([Parameter(Mandatory = $true)][string]$SID)
     try {
         $sidObject = New-Object System.Security.Principal.SecurityIdentifier($SID)
-        $account = $sidObject.Translate(
-            [System.Security.Principal.NTAccount]
-        )
-
-        return $account.Value
+        return $sidObject.Translate([System.Security.Principal.NTAccount]).Value
     }
-    catch {
-        return $SID
-    }
+    catch { return $SID }
 }
-
-# ============================================================
-# PROFILE MANAGEMENT CLASSIFICATION
-# ============================================================
 
 function Get-ProfileManagementClassification {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$SID,
-
+        [Parameter(Mandatory = $true)][string]$SID,
+        [Parameter(Mandatory = $true)][string]$AccountName,
+        [Parameter(Mandatory = $true)][string]$ProfilePath,
         [bool]$Special = $false
     )
 
     $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
-    $protectedSids = @(
-        'S-1-5-18', # SYSTEM
-        'S-1-5-19', # LOCAL SERVICE
-        'S-1-5-20'  # NETWORK SERVICE
-    )
-
-    if ($SID -eq $currentSid) {
-        return [PSCustomObject]@{
-            CanManage = $false
-            Status = 'Blocked - Current User'
-            Reason = 'The currently logged-on profile cannot be reset or destructively managed while in use.'
-        }
+    # 1. Block Well-Known Windows System & Service SIDs
+    # S-1-5-18 (Local System), S-1-5-19 (Local Service), S-1-5-20 (Network Service)
+    # S-1-5-500 (Built-in Administrator), S-1-5-501 (Guest)
+    $protectedSids = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')
+    if ($SID -in $protectedSids -or $SID.EndsWith('-500') -or $SID.EndsWith('-501')) {
+        return [PSCustomObject]@{ CanManage = $false; Status = 'Blocked - System Account'; Reason = 'Built-in Windows system or administrator SID.' }
     }
 
-    if ($SID -in $protectedSids) {
-        return [PSCustomObject]@{
-            CanManage = $false
-            Status = 'Blocked - System Profile'
-            Reason = 'Built-in Windows service profile.'
-        }
+    # 2. Block Protected Account Names & System Profiles
+    $normalizedName = $AccountName.Trim()
+    $protectedNames = @('Administrator', 'Admin', 'DefaultAccount', 'Guest', 'WDAGUtilityAccount', 'Public', 'Default')
+    
+    # Strip domain prefix if present (e.g., LAB1-MAIN\Administrator -> Administrator)
+    $shortName = if ($normalizedName -contains '\') { $normalizedName.Split('\')[-1] } else { $normalizedName }
+
+    if ($shortName -in $protectedNames) {
+        return [PSCustomObject]@{ CanManage = $false; Status = 'Blocked - System Profile'; Reason = 'Built-in Windows administrative or default profile.' }
     }
 
+    # 3. Block Protected Profile Directory Paths
+    $normalizedPath = $ProfilePath.ToLowerInvariant().TrimEnd('\')
+    if ($normalizedPath -like '*\public' -or $normalizedPath -like '*\default' -or $normalizedPath -like '*\administrator') {
+        return [PSCustomObject]@{ CanManage = $false; Status = 'Blocked - System Path'; Reason = 'System directory path reserved by Windows.' }
+    }
+
+    # 4. Block Windows "Special" Profiles flag
     if ($Special) {
-        return [PSCustomObject]@{
-            CanManage = $false
-            Status = 'Blocked - Special Profile'
-            Reason = 'Windows marked this profile as special.'
-        }
+        return [PSCustomObject]@{ CanManage = $false; Status = 'Blocked - Special Profile'; Reason = 'Flagged as a special profile by Windows OS.' }
     }
 
-    return [PSCustomObject]@{
-        CanManage = $true
-        Status = 'Manageable'
-        Reason = 'Profile passed the basic management safety checks.'
+    # 5. Block the Currently Active Logged-On Session
+    if ($SID -eq $currentSid) {
+        return [PSCustomObject]@{ CanManage = $false; Status = 'Blocked - Active User Session'; Reason = 'Currently logged-on active profile.' }
     }
+
+    # 6. Passed all safety rules -> Normal Manageable Standard User
+    return [PSCustomObject]@{ CanManage = $true; Status = 'Manageable'; Reason = 'Standard user profile ready for maintenance.' }
 }
 
-# ============================================================
-# DIRECTORY SCANNER
-# ============================================================
+function Test-IsCompiledExecutable {
+    param([Parameter(Mandatory = $true)][System.IO.FileInfo]$FileInfo)
+
+    if ($FileInfo.Extension -ne '.exe') { return $false }
+
+    try {
+        $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($FileInfo.FullName)
+        $hasCompany = -not [string]::IsNullOrWhiteSpace($versionInfo.CompanyName)
+        $hasProduct = -not [string]::IsNullOrWhiteSpace($versionInfo.ProductName)
+        $hasDescription = -not [string]::IsNullOrWhiteSpace($versionInfo.FileDescription)
+
+        if (-not ($hasCompany -or $hasProduct) -and -not $hasDescription) { return $true }
+        if ($versionInfo.ProductName -match 'Dev-C\+\+|MinGW|GCC|ConsoleApplication' -or $versionInfo.CompanyName -match 'Free Software Foundation') { return $true }
+    }
+    catch { return $true }
+
+    return $false
+}
 
 function Get-DirectoryScan {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path
-    )
+    param([Parameter(Mandatory = $true)][string]$Path)
 
     $startTime = Get-Date
     $totalBytes = [int64]0
@@ -189,17 +162,7 @@ function Get-DirectoryScan {
     $reparsePointCount = 0
 
     if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
-        return [PSCustomObject]@{
-            Path = $Path
-            Exists = $false
-            SizeBytes = [int64]0
-            SizeGB = 0
-            FileCount = 0
-            DirectoryCount = 0
-            ErrorCount = 0
-            ReparsePointCount = 0
-            DurationSeconds = 0
-        }
+        return [PSCustomObject]@{ Path = $Path; Exists = $false; SizeBytes = [int64]0; SizeFormatted = '0 Bytes'; FileCount = 0; DirectoryCount = 0; ErrorCount = 0; ReparsePointCount = 0; DurationSeconds = 0 }
     }
 
     try {
@@ -211,103 +174,94 @@ function Get-DirectoryScan {
             $currentPath = $directories.Pop()
             $directoryCount++
 
-            try {
-                $items = Get-ChildItem -LiteralPath $currentPath -Force -ErrorAction Stop
-            }
-            catch {
-                $errorCount++
-                continue
-            }
+            try { $items = Get-ChildItem -LiteralPath $currentPath -Force -ErrorAction Stop }
+            catch { $errorCount++; continue }
 
             foreach ($item in $items) {
                 try {
-                    $isReparsePoint = (
-                        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-                    )
+                    $isReparsePoint = (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+                    if ($isReparsePoint) { $reparsePointCount++; continue }
 
-                    if ($isReparsePoint) {
-                        $reparsePointCount++
-                        continue
-                    }
-
-                    if ($item.PSIsContainer) {
-                        $directories.Push($item.FullName)
-                    }
-                    else {
-                        $totalBytes += [int64]$item.Length
-                        $fileCount++
-                    }
+                    if ($item.PSIsContainer) { $directories.Push($item.FullName) }
+                    else { $totalBytes += [int64]$item.Length; $fileCount++ }
                 }
-                catch {
-                    $errorCount++
-                }
+                catch { $errorCount++ }
             }
         }
     }
-    catch {
-        $errorCount++
-    }
+    catch { $errorCount++ }
 
     $endTime = Get-Date
-
-    [PSCustomObject]@{
-        Path = $Path
-        Exists = $true
-        SizeBytes = $totalBytes
-        SizeGB = [math]::Round(($totalBytes / 1GB), 2)
-        FileCount = $fileCount
-        DirectoryCount = $directoryCount
-        ErrorCount = $errorCount
-        ReparsePointCount = $reparsePointCount
-        DurationSeconds = [math]::Round(($endTime - $startTime).TotalSeconds, 2)
-    }
+    [PSCustomObject]@{ Path = $Path; Exists = $true; SizeBytes = $totalBytes; SizeFormatted = Format-HumanSize -Bytes $totalBytes; FileCount = $fileCount; DirectoryCount = $directoryCount; ErrorCount = $errorCount; ReparsePointCount = $reparsePointCount; DurationSeconds = [math]::Round(($endTime - $startTime).TotalSeconds, 2) }
 }
 
-# ============================================================
-# PROFILE DISCOVERY
-# ============================================================
+function Get-DesktopSelectiveScan {
+    param([Parameter(Mandatory = $true)][string]$DesktopPath)
+
+    $totalBytes = [int64]0
+    $fileCount = 0
+    $targetItems = @()
+
+    if (-not (Test-Path -LiteralPath $DesktopPath -PathType Container)) {
+        return [PSCustomObject]@{ SizeBytes = [int64]0; FileCount = 0; Items = @() }
+    }
+
+    try {
+        $items = Get-ChildItem -LiteralPath $DesktopPath -Force -ErrorAction Stop
+        foreach ($item in $items) {
+            $isReparsePoint = (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+            if ($isReparsePoint) { continue }
+
+            # Preserve directories, shortcuts, AND desktop.ini
+            if ($item.PSIsContainer) {
+                $scan = Get-DirectoryScan -Path $item.FullName
+                $totalBytes += $scan.SizeBytes
+                $fileCount += $scan.FileCount
+                $targetItems += $item.FullName
+            }
+            else {
+                # Skip shortcuts and system folder metadata
+                if ($item.Extension -in @('.lnk', '.url') -or $item.Name -eq 'desktop.ini') { continue }
+
+                if ($item.Extension -eq '.exe') {
+                    if (Test-IsCompiledExecutable -FileInfo $item) {
+                        $totalBytes += $item.Length
+                        $fileCount++
+                        $targetItems += $item.FullName
+                    }
+                    continue
+                }
+
+                # Standard loose user document/file on Desktop
+                $totalBytes += $item.Length
+                $fileCount++
+                $targetItems += $item.FullName
+            }
+        }
+    }
+    catch {}
+
+    return [PSCustomObject]@{ SizeBytes = $totalBytes; FileCount = $fileCount; Items = $targetItems }
+}
 
 function Get-WindowsUserProfiles {
     Write-Log -Message 'Discovering Windows user profiles.'
-
-    $profileInstances = @(
-        Get-CimInstance -ClassName Win32_UserProfile |
-        Where-Object {
-            -not [string]::IsNullOrWhiteSpace($_.LocalPath)
-        }
-    )
-
+    $profileInstances = @(Get-CimInstance -ClassName Win32_UserProfile | Where-Object { -not [string]::IsNullOrWhiteSpace($_.LocalPath) })
     $profileResults = @()
 
     foreach ($profileInstance in $profileInstances) {
         $profilePath = $profileInstance.LocalPath
+        if (-not (Test-Path -LiteralPath $profilePath -PathType Container)) { continue }
 
-        if (-not (Test-Path -LiteralPath $profilePath -PathType Container)) {
-            continue
-        }
-
-        $directoryInfo = $null
-
-        try {
-            $directoryInfo = Get-Item -LiteralPath $profilePath -Force -ErrorAction Stop
-        }
-        catch {
-            $directoryInfo = $null
-        }
-
-        $lastWriteTime = if ($null -ne $directoryInfo) {
-            $directoryInfo.LastWriteTime
-        }
-        else {
-            $null
-        }
-
+        $directoryInfo = try { Get-Item -LiteralPath $profilePath -Force -ErrorAction Stop } catch { $null }
+        $lastWriteTime = if ($null -ne $directoryInfo) { $directoryInfo.LastWriteTime } else { $null }
         $accountName = Resolve-SidToAccountName -SID $profileInstance.SID
-
+        # $management = Get-ProfileManagementClassification -SID $profileInstance.SID -Special ([bool]$profileInstance.Special)
         $management = Get-ProfileManagementClassification `
-            -SID $profileInstance.SID `
-            -Special ([bool]$profileInstance.Special)
-
+                        -SID $profileInstance.SID `
+                        -AccountName $accountName `
+                        -ProfilePath $profilePath `
+                        -Special ([bool]$profileInstance.Special)
         $profileStatistics = Get-DirectoryScan -Path $profilePath
 
         $profileResults += [PSCustomObject]@{
@@ -317,7 +271,7 @@ function Get-WindowsUserProfiles {
             Loaded = [bool]$profileInstance.Loaded
             Special = [bool]$profileInstance.Special
             SizeBytes = $profileStatistics.SizeBytes
-            SizeGB = $profileStatistics.SizeGB
+            SizeFormatted = $profileStatistics.SizeFormatted
             FileCount = $profileStatistics.FileCount
             DirectoryCount = $profileStatistics.DirectoryCount
             ScanErrorCount = $profileStatistics.ErrorCount
@@ -332,23 +286,10 @@ function Get-WindowsUserProfiles {
     return $profileResults
 }
 
-# ============================================================
-# PROFILE SELECTION
-# ============================================================
-
 function Select-Profile {
-    param(
-        [Parameter(Mandatory = $true)]
-        [array]$Profiles
-    )
+    param([Parameter(Mandatory = $true)][array]$Profiles)
 
-    $usableProfiles = @($Profiles)
-
-    if ($usableProfiles.Count -eq 0) {
-        Write-Host ''
-        Write-Host 'No Windows user profiles were found.' -ForegroundColor Yellow
-        return $null
-    }
+    if ($Profiles.Count -eq 0) { return $null }
 
     while ($true) {
         Clear-Host
@@ -357,461 +298,130 @@ function Select-Profile {
         Write-Host '============================================'
         Write-Host ''
 
-        for ($index = 0; $index -lt $usableProfiles.Count; $index++) {
-            $profileEntry = $usableProfiles[$index]
-
-            $status = if ($profileEntry.CanManage) {
-                'Manageable'
-            }
-            else {
-                $profileEntry.ManagementStatus
-            }
-
-            Write-Host (
-                '[{0}] {1} ({2} GB) - {3}' -f
-                ($index + 1),
-                $profileEntry.Username,
-                $profileEntry.SizeGB,
-                $status
-            )
+        for ($index = 0; $index -lt $Profiles.Count; $index++) {
+            $profileEntry = $Profiles[$index]
+            $status = if ($profileEntry.CanManage) { 'Manageable' } else { $profileEntry.ManagementStatus }
+            Write-Host ('[{0}] {1} ({2}) - {3}' -f ($index + 1), $profileEntry.Username, $profileEntry.SizeFormatted, $status)
         }
 
         Write-Host ''
         $selection = Read-Host 'Enter profile number or Q to cancel'
-
-        if ($selection -match '^[Qq]$') {
-            return $null
-        }
+        if ($selection -match '^[Qq]$') { return $null }
 
         $number = 0
-
         if ([int]::TryParse($selection, [ref]$number)) {
-            if ($number -ge 1 -and $number -le $usableProfiles.Count) {
-                return $usableProfiles[$number - 1]
-            }
+            if ($number -ge 1 -and $number -le $Profiles.Count) { return $Profiles[$number - 1] }
         }
-
-        Write-Host ''
-        Write-Host 'Invalid selection.' -ForegroundColor Yellow
-        Start-Sleep -Seconds 1
     }
 }
 
-# ============================================================
-# PATH CLASSIFICATION
-# ============================================================
-
 function Get-PathClassification {
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$Path,
-
-        [Parameter(Mandatory = $true)]
-        [string]$Name
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Name
     )
 
     $normalizedPath = $Path.ToLowerInvariant()
     $normalizedName = $Name.ToLowerInvariant()
 
-    if (
-        $normalizedPath -like '*\appdata\local\temp' -or
-        $normalizedPath -like '*\appdata\local\temp\*' -or
-        $normalizedPath -like '*\appdata\local\crashdumps' -or
-        $normalizedPath -like '*\appdata\local\crashdumps\*' -or
-        $normalizedPath -like '*\appdata\local\microsoft\windows\wer' -or
-        $normalizedPath -like '*\appdata\local\microsoft\windows\wer\*'
-    ) {
+    if ($normalizedPath -like '*\appdata\local\temp*' -or $normalizedPath -like '*\appdata\local\crashdumps*' -or $normalizedPath -like '*\appdata\local\microsoft\windows\wer*') {
         return 'Safe Cleanup'
     }
-
-    if (
-        $normalizedPath -like '*\appdata\local\google\*' -or
-        $normalizedPath -like '*\appdata\local\microsoft\edge\*' -or
-        $normalizedPath -like '*\appdata\local\microsoft\teams\*' -or
-        $normalizedPath -like '*\appdata\local\packages\*' -or
-        $normalizedPath -like '*\appdata\local\microsoft\windows\explorer\*'
-    ) {
-        return 'Review'
+    if ($normalizedName -in @('downloads', 'documents', 'pictures', 'videos', 'music', 'saved games') -or $normalizedPath -like '*\appdata\roaming\microsoft\windows\recent*') {
+        return 'Purge Candidate'
     }
-
-    if ($normalizedName -eq 'appdata') {
-        return 'Review'
-    }
-
-    if (
-        $normalizedName -in @(
-            'desktop',
-            'documents',
-            'downloads',
-            'pictures',
-            'videos',
-            'music',
-            'onedrive'
-        )
-    ) {
-        return 'Preserve'
-    }
-
-    if (
-        $normalizedName -in @(
-            'ntuser.dat',
-            'ntuser.dat.log1',
-            'ntuser.dat.log2',
-            'ntuser.ini'
-        )
-    ) {
-        return 'Protected'
-    }
+    if ($normalizedName -eq 'desktop') { return 'Selective Clean' }
+    if ($normalizedName -eq 'appdata') { return 'Review' }
+    if ($normalizedName -in @('ntuser.dat', 'ntuser.dat.log1', 'ntuser.dat.log2', 'ntuser.ini')) { return 'Protected' }
 
     return 'Informational'
 }
 
-# ============================================================
-# TOP-LEVEL ANALYSIS
-# ============================================================
-
 function Get-ProfileTopLevelAnalysis {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ProfilePath
-    )
+    param([Parameter(Mandatory = $true)][string]$ProfilePath)
 
     $results = @()
+    if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) { return $results }
 
-    if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) {
-        return $results
-    }
-
-    try {
-        $items = Get-ChildItem -LiteralPath $ProfilePath -Force -ErrorAction Stop
-    }
-    catch {
-        Write-Log -Message (
-            'Unable to enumerate profile root: {0}' -f $_.Exception.Message
-        ) -Level WARNING
-        return $results
-    }
+    try { $items = Get-ChildItem -LiteralPath $ProfilePath -Force -ErrorAction Stop } catch { return $results }
 
     foreach ($item in $items) {
-        $isReparsePoint = (
-            ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-        )
+        $isReparsePoint = (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
 
         if ($isReparsePoint) {
-            $results += [PSCustomObject]@{
-                Name = $item.Name
-                Path = $item.FullName
-                Type = if ($item.PSIsContainer) { 'Directory' } else { 'File' }
-                SizeBytes = [int64]0
-                SizeGB = 0
-                FileCount = 0
-                DirectoryCount = 0
-                ErrorCount = 0
-                Classification = 'Protected'
-                ReparsePoint = $true
-            }
+            $results += [PSCustomObject]@{ Name = $item.Name; Path = $item.FullName; Type = if ($item.PSIsContainer) { 'Directory' } else { 'File' }; SizeBytes = [int64]0; SizeFormatted = '0 Bytes'; Classification = 'Protected' }
             continue
         }
 
         if ($item.PSIsContainer) {
-            $statistics = Get-DirectoryScan -Path $item.FullName
-            $classification = Get-PathClassification -Path $item.FullName -Name $item.Name
-
-            $results += [PSCustomObject]@{
-                Name = $item.Name
-                Path = $item.FullName
-                Type = 'Directory'
-                SizeBytes = $statistics.SizeBytes
-                SizeGB = $statistics.SizeGB
-                FileCount = $statistics.FileCount
-                DirectoryCount = $statistics.DirectoryCount
-                ErrorCount = $statistics.ErrorCount
-                Classification = $classification
-                ReparsePoint = $false
+            if ($item.Name -eq 'Desktop') {
+                $desktopScan = Get-DesktopSelectiveScan -DesktopPath $item.FullName
+                $results += [PSCustomObject]@{ Name = $item.Name; Path = $item.FullName; Type = 'Directory'; SizeBytes = $desktopScan.SizeBytes; SizeFormatted = Format-HumanSize -Bytes $desktopScan.SizeBytes; Classification = 'Selective Clean' }
+            }
+            else {
+                $statistics = Get-DirectoryScan -Path $item.FullName
+                $classification = Get-PathClassification -Path $item.FullName -Name $item.Name
+                $results += [PSCustomObject]@{ Name = $item.Name; Path = $item.FullName; Type = 'Directory'; SizeBytes = $statistics.SizeBytes; SizeFormatted = $statistics.SizeFormatted; Classification = $classification }
             }
         }
         else {
-            $fileSize = [int64]0
-
-            try {
-                $fileSize = [int64]$item.Length
-            }
-            catch {
-                $fileSize = [int64]0
-            }
-
+            $fileSize = try { [int64]$item.Length } catch { [int64]0 }
             $classification = Get-PathClassification -Path $item.FullName -Name $item.Name
-
-            $results += [PSCustomObject]@{
-                Name = $item.Name
-                Path = $item.FullName
-                Type = 'File'
-                SizeBytes = $fileSize
-                SizeGB = [math]::Round(($fileSize / 1GB), 2)
-                FileCount = 1
-                DirectoryCount = 0
-                ErrorCount = 0
-                Classification = $classification
-                ReparsePoint = $false
-            }
+            $results += [PSCustomObject]@{ Name = $item.Name; Path = $item.FullName; Type = 'File'; SizeBytes = $fileSize; SizeFormatted = Format-HumanSize -Bytes $fileSize; Classification = $classification }
         }
     }
 
     return $results
 }
-
-# ============================================================
-# APPDATA ANALYSIS
-# ============================================================
-
-function Get-AppDataAnalysis {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ProfilePath
-    )
-
-    $appDataPath = Join-Path -Path $ProfilePath -ChildPath 'AppData'
-    $results = @()
-
-    if (-not (Test-Path -LiteralPath $appDataPath -PathType Container)) {
-        return $results
-    }
-
-    foreach ($locationName in @('Local', 'Roaming', 'LocalLow')) {
-        $locationPath = Join-Path -Path $appDataPath -ChildPath $locationName
-
-        if (-not (Test-Path -LiteralPath $locationPath -PathType Container)) {
-            continue
-        }
-
-        $locationStatistics = Get-DirectoryScan -Path $locationPath
-
-        $results += [PSCustomObject]@{
-            Level = 1
-            Name = $locationName
-            Path = $locationPath
-            SizeBytes = $locationStatistics.SizeBytes
-            SizeGB = $locationStatistics.SizeGB
-            FileCount = $locationStatistics.FileCount
-            DirectoryCount = $locationStatistics.DirectoryCount
-            ErrorCount = $locationStatistics.ErrorCount
-            Classification = 'Review'
-            Parent = 'AppData'
-        }
-
-        try {
-            $children = Get-ChildItem `
-                -LiteralPath $locationPath `
-                -Force `
-                -Directory `
-                -ErrorAction Stop
-        }
-        catch {
-            Write-Log -Message (
-                'Unable to enumerate AppData location {0}: {1}' -f
-                $locationPath,
-                $_.Exception.Message
-            ) -Level WARNING
-            continue
-        }
-
-        foreach ($child in $children) {
-            $isReparsePoint = (
-                ($child.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
-            )
-
-            if ($isReparsePoint) {
-                continue
-            }
-
-            $childStatistics = Get-DirectoryScan -Path $child.FullName
-            $classification = Get-PathClassification `
-                -Path $child.FullName `
-                -Name $child.Name
-
-            $results += [PSCustomObject]@{
-                Level = 2
-                Name = $child.Name
-                Path = $child.FullName
-                SizeBytes = $childStatistics.SizeBytes
-                SizeGB = $childStatistics.SizeGB
-                FileCount = $childStatistics.FileCount
-                DirectoryCount = $childStatistics.DirectoryCount
-                ErrorCount = $childStatistics.ErrorCount
-                Classification = $classification
-                Parent = $locationName
-            }
-        }
-    }
-
-    return $results
-}
-
-# ============================================================
-# CLEANUP CANDIDATE DEFINITIONS
-# ============================================================
 
 function Get-CleanupCandidateAnalysis {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ProfilePath
-    )
+    param([Parameter(Mandatory = $true)][string]$ProfilePath)
 
     $candidateDefinitions = @(
-        @{
-            Name = 'User Temp'
-            RelativePath = 'AppData\Local\Temp'
-            Classification = 'Safe Cleanup'
-            Reason = 'Temporary user application data.'
-            CleanupLevel = 'Light'
-        },
-        @{
-            Name = 'Crash Dumps'
-            RelativePath = 'AppData\Local\CrashDumps'
-            Classification = 'Safe Cleanup'
-            Reason = 'Per-user application crash dump files.'
-            CleanupLevel = 'Light'
-        },
-        @{
-            Name = 'Windows Error Reporting'
-            RelativePath = 'AppData\Local\Microsoft\Windows\WER'
-            Classification = 'Safe Cleanup'
-            Reason = 'Windows Error Reporting data.'
-            CleanupLevel = 'Light'
-        },
-        @{
-            Name = 'Explorer Cache'
-            RelativePath = 'AppData\Local\Microsoft\Windows\Explorer'
-            Classification = 'Review'
-            Reason = 'Explorer cache contains operational state and thumbnails.'
-            CleanupLevel = 'Deep'
-        },
-        @{
-            Name = 'Google Application Data'
-            RelativePath = 'AppData\Local\Google'
-            Classification = 'Review'
-            Reason = 'Application data may include caches, profiles, extensions, and settings.'
-            CleanupLevel = 'Deep'
-        },
-        @{
-            Name = 'Microsoft Edge Application Data'
-            RelativePath = 'AppData\Local\Microsoft\Edge'
-            Classification = 'Review'
-            Reason = 'Browser data can include cache, profile state, extensions, and settings.'
-            CleanupLevel = 'Deep'
-        },
-        @{
-            Name = 'Windows Packages'
-            RelativePath = 'AppData\Local\Packages'
-            Classification = 'Review'
-            Reason = 'Packaged application data must be handled selectively.'
-            CleanupLevel = 'Deep'
-        }
+        @{ Name = 'User Temp'; RelativePath = 'AppData\Local\Temp'; Classification = 'Safe Cleanup'; Level = 'Light'; Reason = 'Temporary application files.' },
+        @{ Name = 'Crash Dumps'; RelativePath = 'AppData\Local\CrashDumps'; Classification = 'Safe Cleanup'; Level = 'Light'; Reason = 'Per-user crash log files.' },
+        @{ Name = 'Windows Error Reporting'; RelativePath = 'AppData\Local\Microsoft\Windows\WER'; Classification = 'Safe Cleanup'; Level = 'Light'; Reason = 'WER diagnostic reports.' },
+        @{ Name = 'Recycle Bin'; RelativePath = 'AppData\Local\Microsoft\Windows\Explorer'; Classification = 'Safe Cleanup'; Level = 'Light'; Reason = 'Empties deleted items from the Recycle Bin.' },
+        @{ Name = 'Downloads Library'; RelativePath = 'Downloads'; Classification = 'Purge Candidate'; Level = 'Deep'; Reason = 'Downloaded user files.' },
+        @{ Name = 'Documents Library'; RelativePath = 'Documents'; Classification = 'Purge Candidate'; Level = 'Deep'; Reason = 'User documents.' },
+        @{ Name = 'Pictures Library'; RelativePath = 'Pictures'; Classification = 'Purge Candidate'; Level = 'Deep'; Reason = 'User pictures and images.' },
+        @{ Name = 'Videos Library'; RelativePath = 'Videos'; Classification = 'Purge Candidate'; Level = 'Deep'; Reason = 'User media/video files.' },
+        @{ Name = 'Music Library'; RelativePath = 'Music'; Classification = 'Purge Candidate'; Level = 'Deep'; Reason = 'User audio files.' },
+        @{ Name = 'Selective Desktop Clean'; RelativePath = 'Desktop'; Classification = 'Selective Clean'; Level = 'Deep'; Reason = 'User docs & compiled .exe files (Shortcuts & App .exe preserved).' },
+        @{ Name = 'Quick Access & Favorites Reset'; RelativePath = 'AppData\Roaming\Microsoft\Windows\Recent'; Classification = 'Purge Candidate'; Level = 'Deep'; Reason = 'Resets File Explorer Quick Access pins, Favorites, and Recent items to factory default.' },
+        @{ Name = 'Explorer Cache'; RelativePath = 'AppData\Local\Microsoft\Windows\Explorer'; Classification = 'Purge Candidate'; Level = 'Deep'; Reason = 'Explorer thumbnail and icon cache.' }
     )
 
     $results = @()
 
     foreach ($definition in $candidateDefinitions) {
-        $targetPath = Join-Path `
-            -Path $ProfilePath `
-            -ChildPath $definition.RelativePath
+        $targetPath = Join-Path -Path $ProfilePath -ChildPath $definition.RelativePath
+        if (-not (Test-Path -LiteralPath $targetPath -PathType Container)) { continue }
 
-        if (-not (Test-Path -LiteralPath $targetPath -PathType Container)) {
-            continue
+        if ($definition.Name -eq 'Selective Desktop Clean') {
+            $desktopScan = Get-DesktopSelectiveScan -DesktopPath $targetPath
+            if ($desktopScan.SizeBytes -gt 0) {
+                $results += [PSCustomObject]@{ Name = $definition.Name; Path = $targetPath; SizeBytes = $desktopScan.SizeBytes; SizeFormatted = Format-HumanSize -Bytes $desktopScan.SizeBytes; Classification = $definition.Classification; Reason = $definition.Reason; CleanupLevel = $definition.Level; TargetItems = $desktopScan.Items }
+            }
         }
-
-        $statistics = Get-DirectoryScan -Path $targetPath
-
-        $results += [PSCustomObject]@{
-            Name = $definition.Name
-            Path = $targetPath
-            RelativePath = $definition.RelativePath
-            SizeBytes = $statistics.SizeBytes
-            SizeGB = $statistics.SizeGB
-            FileCount = $statistics.FileCount
-            DirectoryCount = $statistics.DirectoryCount
-            ErrorCount = $statistics.ErrorCount
-            Classification = $definition.Classification
-            Reason = $definition.Reason
-            CleanupLevel = $definition.CleanupLevel
-            ReadOnly = $true
+        else {
+            $statistics = Get-DirectoryScan -Path $targetPath
+            if ($statistics.SizeBytes -gt 0) {
+                $results += [PSCustomObject]@{ Name = $definition.Name; Path = $targetPath; SizeBytes = $statistics.SizeBytes; SizeFormatted = $statistics.SizeFormatted; Classification = $definition.Classification; Reason = $definition.Reason; CleanupLevel = $definition.Level; TargetItems = @($targetPath) }
+            }
         }
     }
 
     return $results
 }
 
-# ============================================================
-# PHASE 2.2 CLEANUP INTELLIGENCE
-# ============================================================
+function Invoke-ProfileAnalysisV30 {
+    param([Parameter(Mandatory = $true)][PSCustomObject]$ProfileInfo)
 
-function Get-CleanupRecommendations {
-    param(
-        [Parameter(Mandatory = $true)]
-        [array]$Candidates
-    )
-
-    $recommendations = @()
-
-    foreach ($candidate in $Candidates) {
-        if ($candidate.SizeBytes -le 0) {
-            continue
-        }
-
-        $action = switch ($candidate.Classification) {
-            'Safe Cleanup' { 'Eligible' }
-            'Review' { 'Review Required' }
-            'Preserve' { 'Preserve' }
-            'Protected' { 'Protected' }
-            default { 'Informational' }
-        }
-
-        $confidence = switch ($candidate.Classification) {
-            'Safe Cleanup' { 'High' }
-            'Review' { 'Medium' }
-            default { 'N/A' }
-        }
-
-        $recommendations += [PSCustomObject]@{
-            Name = $candidate.Name
-            Path = $candidate.Path
-            SizeBytes = $candidate.SizeBytes
-            SizeGB = $candidate.SizeGB
-            Classification = $candidate.Classification
-            Action = $action
-            Confidence = $confidence
-            CleanupLevel = $candidate.CleanupLevel
-            Reason = $candidate.Reason
-        }
-    }
-
-    return $recommendations
-}
-
-# ============================================================
-# FULL PROFILE ANALYSIS v2.2
-# ============================================================
-
-function Invoke-ProfileAnalysisV22 {
-    param(
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$ProfileInfo
-    )
-
-    if (-not $ProfileInfo.CanManage) {
-        Write-Log -Message (
-            'Profile analysis blocked: {0}; Reason: {1}' -f
-            $ProfileInfo.Username,
-            $ProfileInfo.ManagementReason
-        ) -Level SECURITY
-        return $null
-    }
+    if (-not $ProfileInfo.CanManage) { return $null }
 
     $analysisStart = Get-Date
-
-    Write-Log -Message (
-        'Starting Phase 2.2 analysis: {0}' -f $ProfileInfo.Username
-    )
+    Write-Log -Message ('Starting Phase 3.1 analysis: {0}' -f $ProfileInfo.Username)
 
     Write-Host ''
     Write-Host 'Analyzing profile...' -ForegroundColor Cyan
@@ -819,129 +429,220 @@ function Invoke-ProfileAnalysisV22 {
     Write-Host ('Path : {0}' -f $ProfileInfo.ProfilePath)
     Write-Host ''
 
-    Write-Host '[1/4] Scanning profile structure...' -ForegroundColor DarkCyan
     $topLevel = @(Get-ProfileTopLevelAnalysis -ProfilePath $ProfileInfo.ProfilePath)
-
-    Write-Host '[2/4] Analyzing AppData...' -ForegroundColor DarkCyan
-    $appData = @(Get-AppDataAnalysis -ProfilePath $ProfileInfo.ProfilePath)
-
-    Write-Host '[3/4] Detecting cleanup candidates...' -ForegroundColor DarkCyan
-    $cleanupCandidates = @(
-        Get-CleanupCandidateAnalysis -ProfilePath $ProfileInfo.ProfilePath
-    )
-
-    Write-Host '[4/4] Building cleanup recommendations...' -ForegroundColor DarkCyan
-    $recommendations = @(
-        Get-CleanupRecommendations -Candidates $cleanupCandidates
-    )
+    $cleanupCandidates = @(Get-CleanupCandidateAnalysis -ProfilePath $ProfileInfo.ProfilePath)
 
     $safeCleanupBytes = [int64]0
-    $reviewBytes = [int64]0
+    $purgeBytes = [int64]0
 
-    foreach ($recommendation in $recommendations) {
-        if ($recommendation.Classification -eq 'Safe Cleanup') {
-            $safeCleanupBytes += [int64]$recommendation.SizeBytes
-        }
-        elseif ($recommendation.Classification -eq 'Review') {
-            $reviewBytes += [int64]$recommendation.SizeBytes
-        }
+    foreach ($candidate in $cleanupCandidates) {
+        if ($candidate.Classification -eq 'Safe Cleanup') { $safeCleanupBytes += $candidate.SizeBytes }
+        else { $purgeBytes += $candidate.SizeBytes }
     }
 
     $analysisEnd = Get-Date
 
-    $totalErrors = 0
-
-    foreach ($item in $topLevel) {
-        $totalErrors += $item.ErrorCount
-    }
-
-    foreach ($item in $appData) {
-        $totalErrors += $item.ErrorCount
-    }
-
-    foreach ($item in $cleanupCandidates) {
-        $totalErrors += $item.ErrorCount
-    }
-
     $analysis = [PSCustomObject]@{
-        Version = '2.2.0'
-        ReadOnly = $true
+        Version = '3.1.0'
         Username = $ProfileInfo.Username
         SID = $ProfileInfo.SID
         ProfilePath = $ProfileInfo.ProfilePath
-        ProfileSizeGB = $ProfileInfo.SizeGB
+        ProfileSizeFormatted = $ProfileInfo.SizeFormatted
         ProfileLoaded = $ProfileInfo.Loaded
         TopLevel = $topLevel
-        AppData = $appData
         CleanupCandidates = $cleanupCandidates
-        Recommendations = $recommendations
         SafeCleanupBytes = $safeCleanupBytes
-        SafeCleanupGB = [math]::Round(($safeCleanupBytes / 1GB), 2)
-        ReviewBytes = $reviewBytes
-        ReviewGB = [math]::Round(($reviewBytes / 1GB), 2)
-        TotalScanErrors = $totalErrors
-        Started = $analysisStart
-        Completed = $analysisEnd
+        SafeCleanupFormatted = Format-HumanSize -Bytes $safeCleanupBytes
+        PurgeBytes = $purgeBytes
+        PurgeFormatted = Format-HumanSize -Bytes $purgeBytes
         DurationSeconds = [math]::Round(($analysisEnd - $analysisStart).TotalSeconds, 2)
     }
 
     $script:LastAnalysis = $analysis
-
-    Write-Log -Message (
-        'Phase 2.2 analysis completed: {0}; Safe: {1} GB; Review: {2} GB; Errors: {3}; Duration: {4}s' -f
-        $analysis.Username,
-        $analysis.SafeCleanupGB,
-        $analysis.ReviewGB,
-        $analysis.TotalScanErrors,
-        $analysis.DurationSeconds
-    ) -Level SUCCESS
-
     return $analysis
 }
 
-# ============================================================
-# DRY RUN
-# ============================================================
-
-function Invoke-CleanupDryRun {
+function Invoke-ProfileCleanup {
     param(
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$Analysis,
-
-        [ValidateSet('Light','Deep')]
-        [string]$CleanupMode = 'Light'
+        [Parameter(Mandatory = $true)][PSCustomObject]$Analysis,
+        [ValidateSet('Light','Deep')][string]$CleanupMode = 'Light'
     )
 
     Clear-Host
-
     Write-Host ''
-    Write-Host 'CLEANUP DRY RUN' -ForegroundColor Cyan
+    Write-Host 'ACTIVE PROFILE CLEANUP ENGINE (PHASE 3)' -ForegroundColor Red
     Write-Host '=================================================='
     Write-Host ''
-
-    Write-Host ('User       : {0}' -f $Analysis.Username)
-    Write-Host ('Profile    : {0}' -f $Analysis.ProfilePath)
-    Write-Host ('Mode       : {0}' -f $CleanupMode)
+    Write-Host ('Target User : {0}' -f $Analysis.Username)
+    Write-Host ('Profile Path: {0}' -f $Analysis.ProfilePath)
+    Write-Host ('Mode        : {0}' -f $CleanupMode)
     Write-Host ''
 
     $eligible = @(
-        $Analysis.Recommendations |
-        Where-Object {
-            if ($CleanupMode -eq 'Light') {
-                $_.Classification -eq 'Safe Cleanup' -and
-                $_.CleanupLevel -eq 'Light'
-            }
-            else {
-                $_.Classification -in @('Safe Cleanup','Review')
-            }
+        $Analysis.CleanupCandidates | Where-Object {
+            if ($CleanupMode -eq 'Light') { $_.Classification -eq 'Safe Cleanup' }
+            else { $true }
         }
     )
 
     if ($eligible.Count -eq 0) {
         Write-Host 'No cleanup candidates match this mode.' -ForegroundColor Yellow
+        return
+    }
+
+    $totalReclaimBytes = [int64]0
+    foreach ($item in $eligible) { $totalReclaimBytes += $item.SizeBytes }
+
+    Write-Host 'TARGETS TO BE PURGED / CLEANED:' -ForegroundColor Yellow
+    foreach ($item in $eligible) {
+        Write-Host (' - {0,-32} [{1}]' -f $item.Name, $item.SizeFormatted) -ForegroundColor Cyan
+    }
+
+    Write-Host ''
+    Write-Host ('Total Potential Space Recovery: {0}' -f (Format-HumanSize -Bytes $totalReclaimBytes)) -ForegroundColor Green
+    Write-Host ''
+    Write-Host 'WARNING: Selected items will be permanently deleted or reset.' -ForegroundColor Red
+    $confirmation = Read-Host 'Type "DELETE" to confirm active cleanup'
+
+    if ($confirmation -ne 'DELETE') {
         Write-Host ''
-        Write-Host 'DRY RUN ONLY - NO FILES WERE MODIFIED.' -ForegroundColor Green
-        Write-Host ''
+        Write-Host 'Cleanup action canceled by administrator.' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host ''
+    Write-Host 'Executing active cleanup...' -ForegroundColor Cyan
+    $errorCount = 0
+
+    foreach ($candidate in $eligible) {
+        Write-Host ('Processing {0}...' -f $candidate.Name) -ForegroundColor DarkCyan
+
+        if ($candidate.Name -eq 'Selective Desktop Clean') {
+            foreach ($itemPath in $candidate.TargetItems) {
+                try {
+                    if (Test-Path -LiteralPath $itemPath) {
+                        Remove-Item -LiteralPath $itemPath -Recurse -Force -ErrorAction Stop
+                        Write-Log -Message ('Deleted desktop item: {0}' -f $itemPath) -Level SUCCESS
+                    }
+                }
+                catch {
+                    $errorCount++
+                    Write-Log -Message ('Failed to delete {0}: {1}' -f $itemPath, $_.Exception.Message) -Level ERROR
+                }
+            }
+        }
+        elseif ($candidate.Name -eq 'Recycle Bin') {
+            try {
+                Clear-RecycleBin -Force -ErrorAction Stop
+                Write-Log -Message 'Recycle Bin successfully emptied.' -Level SUCCESS
+            }
+            catch {
+                $errorCount++
+                Write-Log -Message ('Failed to empty Recycle Bin: {0}' -f $_.Exception.Message) -Level ERROR
+            }
+        }
+        elseif ($candidate.Name -eq 'Quick Access & Favorites Reset') {
+            try {
+                $subfolders = @('AutomaticDestinations', 'CustomDestinations')
+                foreach ($sub in $subfolders) {
+                    $targetFolder = Join-Path $candidate.Path $sub
+                    if (Test-Path -LiteralPath $targetFolder) {
+                        Remove-Item -Path (Join-Path $targetFolder '*') -Force -Recurse -ErrorAction SilentlyContinue
+                    }
+                }
+                Get-ChildItem -LiteralPath $candidate.Path -Filter '*.lnk' -Force -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+                Write-Log -Message 'Quick Access and Favorites successfully reset to factory default.' -Level SUCCESS
+            }
+            catch {
+                $errorCount++
+                Write-Log -Message ('Error resetting Quick Access: {0}' -f $_.Exception.Message) -Level ERROR
+            }
+        }
+        else {
+            try {
+                $subItems = Get-ChildItem -LiteralPath $candidate.Path -Force -ErrorAction Stop
+                foreach ($subItem in $subItems) {
+                    try {
+                        Remove-Item -LiteralPath $subItem.FullName -Recurse -Force -ErrorAction Stop
+                        Write-Log -Message ('Deleted: {0}' -f $subItem.FullName) -Level SUCCESS
+                    }
+                    catch {
+                        $errorCount++
+                        Write-Log -Message ('Locked/Skipped: {0}' -f $subItem.FullName) -Level WARNING
+                    }
+                }
+            }
+            catch { $errorCount++ }
+        }
+    }
+
+    Write-Host ''
+    Write-Host 'CLEANUP COMPLETE' -ForegroundColor Green
+    Write-Host ('Errors / Skipped Files: {0}' -f $errorCount)
+}
+
+function Show-ProfileAnalysisV30 {
+    param([Parameter(Mandatory = $true)][PSCustomObject]$Analysis)
+
+    Clear-Host
+    Write-Host ''
+    Write-Host 'WINDOWS PROFILE ANALYZER v3.1' -ForegroundColor Cyan
+    Write-Host '=================================================='
+    Write-Host ''
+    Write-Host ('User              : {0}' -f $Analysis.Username)
+    Write-Host ('Profile           : {0}' -f $Analysis.ProfilePath)
+    Write-Host ('Profile Size      : {0}' -f $Analysis.ProfileSizeFormatted)
+    Write-Host ('Analysis Duration : {0} seconds' -f $Analysis.DurationSeconds)
+    Write-Host ''
+
+    Write-Host 'TOP-LEVEL STORAGE BREAKDOWN' -ForegroundColor Cyan
+    Write-Host '--------------------------------------------------'
+
+    foreach ($item in ($Analysis.TopLevel | Sort-Object -Property SizeBytes -Descending)) {
+        $displayColor = switch ($item.Classification) {
+            'Safe Cleanup' { 'Green' }
+            'Purge Candidate' { 'Yellow' }
+            'Selective Clean' { 'Cyan' }
+            'Protected' { 'Magenta' }
+            default { 'Gray' }
+        }
+
+        Write-Host ('{0,-28} {1,12}   [{2}]' -f $item.Name, $item.SizeFormatted, $item.Classification) -ForegroundColor $displayColor
+    }
+
+    Write-Host ''
+    Write-Host 'ANALYSIS SUMMARY' -ForegroundColor Cyan
+    Write-Host '--------------------------------------------------'
+    Write-Host ('Safe Temp Recovery    : {0}' -f $Analysis.SafeCleanupFormatted) -ForegroundColor Green
+    Write-Host ('Purge/Clean Recovery  : {0}' -f $Analysis.PurgeFormatted) -ForegroundColor Yellow
+    Write-Host ''
+}
+
+function Invoke-CleanupDryRun {
+    param(
+        [Parameter(Mandatory = $true)][PSCustomObject]$Analysis,
+        [ValidateSet('Light','Deep')][string]$CleanupMode = 'Light'
+    )
+
+    Clear-Host
+    Write-Host ''
+    Write-Host 'CLEANUP DRY RUN (PREVIEW)' -ForegroundColor Cyan
+    Write-Host '=================================================='
+    Write-Host ''
+    Write-Host ('User    : {0}' -f $Analysis.Username)
+    Write-Host ('Profile : {0}' -f $Analysis.ProfilePath)
+    Write-Host ('Mode    : {0}' -f $CleanupMode)
+    Write-Host ''
+
+    $eligible = @(
+        $Analysis.CleanupCandidates | Where-Object {
+            if ($CleanupMode -eq 'Light') { $_.Classification -eq 'Safe Cleanup' }
+            else { $true }
+        }
+    )
+
+    if ($eligible.Count -eq 0) {
+        Write-Host 'No candidates match this mode.' -ForegroundColor Yellow
         return
     }
 
@@ -951,486 +652,107 @@ function Invoke-CleanupDryRun {
     Write-Host '--------------------------------------------------'
 
     foreach ($item in $eligible) {
-        $plannedBytes += [int64]$item.SizeBytes
+        $plannedBytes += $item.SizeBytes
+        $color = if ($item.Classification -eq 'Safe Cleanup') { 'Green' } else { 'Yellow' }
 
-        $displayColor = if ($item.Classification -eq 'Safe Cleanup') {
-            'Green'
-        }
-        else {
-            'Yellow'
-        }
-
-        Write-Host (
-            '[{0}] {1,-34} {2,8} GB' -f
-            $item.Classification,
-            $item.Name,
-            $item.SizeGB
-        ) -ForegroundColor $displayColor
-
-        Write-Host (
-            '     Path: {0}' -f
-            $item.Path
-        ) -ForegroundColor DarkGray
-
-        Write-Host (
-            '     Reason: {0}' -f
-            $item.Reason
-        ) -ForegroundColor DarkGray
+        Write-Host ('[{0}] {1,-32} {2,12}' -f $item.Classification, $item.Name, $item.SizeFormatted) -ForegroundColor $color
+        Write-Host ('     Reason: {0}' -f $item.Reason) -ForegroundColor DarkGray
     }
 
     Write-Host ''
-    Write-Host 'DRY RUN SUMMARY' -ForegroundColor Cyan
-    Write-Host '--------------------------------------------------'
-
-    Write-Host (
-        'Candidate Items : {0}' -f
-        $eligible.Count
-    )
-
-    Write-Host (
-        'Potential Space : {0} GB' -f
-        ([math]::Round(($plannedBytes / 1GB), 2))
-    ) -ForegroundColor Green
-
+    Write-Host ('Potential Space Recovery: {0}' -f (Format-HumanSize -Bytes $plannedBytes)) -ForegroundColor Green
     Write-Host ''
-    Write-Host 'IMPORTANT:' -ForegroundColor Yellow
-    Write-Host 'This is a preview only.'
-    Write-Host 'No files, folders, registry keys, or profiles were modified.'
+    Write-Host 'DRY RUN ONLY - NO FILES WERE MODIFIED.' -ForegroundColor Green
     Write-Host ''
 }
-
-# ============================================================
-# ANALYSIS REPORT
-# ============================================================
-
-function Show-ProfileAnalysisV22 {
-    param(
-        [Parameter(Mandatory = $true)]
-        [PSCustomObject]$Analysis
-    )
-
-    Clear-Host
-
-    Write-Host ''
-    Write-Host 'WINDOWS PROFILE ANALYZER v2.2' -ForegroundColor Cyan
-    Write-Host '=================================================='
-    Write-Host ''
-
-    Write-Host ('User              : {0}' -f $Analysis.Username)
-    Write-Host ('Profile           : {0}' -f $Analysis.ProfilePath)
-    Write-Host ('Profile Size      : {0} GB' -f $Analysis.ProfileSizeGB)
-    Write-Host ('Profile Loaded    : {0}' -f $Analysis.ProfileLoaded)
-    Write-Host ('Analysis Duration : {0} seconds' -f $Analysis.DurationSeconds)
-    Write-Host ('Scan Errors       : {0}' -f $Analysis.TotalScanErrors)
-    Write-Host ''
-
-    Write-Host 'TOP-LEVEL STORAGE' -ForegroundColor Cyan
-    Write-Host '--------------------------------------------------'
-
-    $topLevelDirectories = @(
-        $Analysis.TopLevel |
-        Where-Object { $_.Type -eq 'Directory' } |
-        Sort-Object -Property SizeBytes -Descending
-    )
-
-    foreach ($item in $topLevelDirectories) {
-        $displayColor = switch ($item.Classification) {
-            'Safe Cleanup' { 'Green' }
-            'Review' { 'Yellow' }
-            'Preserve' { 'White' }
-            'Protected' { 'Magenta' }
-            default { 'Gray' }
-        }
-
-        Write-Host (
-            '{0,-24} {1,8} GB   [{2}]' -f
-            $item.Name,
-            $item.SizeGB,
-            $item.Classification
-        ) -ForegroundColor $displayColor
-    }
-
-    Write-Host ''
-    Write-Host 'APPDATA STORAGE' -ForegroundColor Cyan
-    Write-Host '--------------------------------------------------'
-
-    $appDataLocations = @(
-        $Analysis.AppData |
-        Where-Object { $_.Level -eq 1 } |
-        Sort-Object -Property SizeBytes -Descending
-    )
-
-    foreach ($location in $appDataLocations) {
-        Write-Host (
-            '+-- {0,-20} {1,8} GB' -f
-            $location.Name,
-            $location.SizeGB
-        ) -ForegroundColor Yellow
-
-        $children = @(
-            $Analysis.AppData |
-            Where-Object {
-                $_.Level -eq 2 -and $_.Parent -eq $location.Name
-            } |
-            Sort-Object -Property SizeBytes -Descending
-        )
-
-        $displayChildren = @($children | Select-Object -First 10)
-
-        foreach ($child in $displayChildren) {
-            $displayColor = switch ($child.Classification) {
-                'Safe Cleanup' { 'Green' }
-                'Review' { 'Yellow' }
-                'Preserve' { 'White' }
-                'Protected' { 'Magenta' }
-                default { 'Gray' }
-            }
-
-            Write-Host (
-                '|   +-- {0,-18} {1,8} GB   [{2}]' -f
-                $child.Name,
-                $child.SizeGB,
-                $child.Classification
-            ) -ForegroundColor $displayColor
-        }
-
-        if ($children.Count -gt 10) {
-            Write-Host (
-                '|   `-- ... {0} additional directories' -f
-                ($children.Count - 10)
-            ) -ForegroundColor DarkGray
-        }
-    }
-
-    Write-Host ''
-    Write-Host 'CLEANUP INTELLIGENCE' -ForegroundColor Cyan
-    Write-Host '--------------------------------------------------'
-
-    $recommendations = @(
-        $Analysis.Recommendations |
-        Sort-Object -Property SizeBytes -Descending
-    )
-
-    if ($recommendations.Count -eq 0) {
-        Write-Host 'No known cleanup candidates detected.' -ForegroundColor Gray
-    }
-    else {
-        foreach ($item in $recommendations) {
-            $displayColor = switch ($item.Classification) {
-                'Safe Cleanup' { 'Green' }
-                'Review' { 'Yellow' }
-                default { 'Gray' }
-            }
-
-            Write-Host (
-                '{0,-34} {1,8} GB   [{2}]' -f
-                $item.Name,
-                $item.SizeGB,
-                $item.Classification
-            ) -ForegroundColor $displayColor
-        }
-    }
-
-    Write-Host ''
-    Write-Host 'ANALYSIS SUMMARY' -ForegroundColor Cyan
-    Write-Host '--------------------------------------------------'
-
-    Write-Host (
-        'Potential Safe Cleanup : {0} GB' -f
-        $Analysis.SafeCleanupGB
-    ) -ForegroundColor Green
-
-    Write-Host (
-        'Potential Review       : {0} GB' -f
-        $Analysis.ReviewGB
-    ) -ForegroundColor Yellow
-
-    Write-Host (
-        'Scan Errors            : {0}' -f
-        $Analysis.TotalScanErrors
-    )
-
-    Write-Host ''
-    Write-Host 'READ-ONLY ANALYSIS - NO FILES WERE MODIFIED.' -ForegroundColor Green
-    Write-Host ''
-}
-
-# ============================================================
-# EXPORT ANALYSIS
-# ============================================================
-
-function Export-LastAnalysis {
-    if ($null -eq $script:LastAnalysis) {
-        Write-Host ''
-        Write-Host 'No analysis is currently available to export.' -ForegroundColor Yellow
-        return
-    }
-
-    $safeName = ($script:LastAnalysis.Username -replace '[\\/:*?"<>|]', '_')
-    $filePath = Join-Path $ExportDirectory (
-        '{0}_Analysis_{1}.json' -f
-        $safeName,
-        (Get-Date -Format 'yyyyMMdd_HHmmss')
-    )
-
-    try {
-        $script:LastAnalysis |
-            ConvertTo-Json -Depth 10 |
-            Set-Content -LiteralPath $filePath -Encoding UTF8
-
-        Write-Log -Message (
-            'Analysis exported: {0}' -f $filePath
-        ) -Level SUCCESS
-
-        Write-Host ''
-        Write-Host 'Analysis exported successfully.' -ForegroundColor Green
-        Write-Host $filePath
-    }
-    catch {
-        Write-Log -Message (
-            'Analysis export failed: {0}' -f $_.Exception.Message
-        ) -Level ERROR
-
-        Write-Host ''
-        Write-Host (
-            'Export failed: {0}' -f $_.Exception.Message
-        ) -ForegroundColor Red
-    }
-}
-
-# ============================================================
-# SYSTEM INFORMATION
-# ============================================================
-
-function Show-SystemInformation {
-    Clear-Host
-
-    Write-Host ''
-    Write-Host 'SYSTEM INFORMATION' -ForegroundColor Cyan
-    Write-Host '=================================================='
-    Write-Host ''
-
-    try {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem
-        $computer = Get-CimInstance -ClassName Win32_ComputerSystem
-
-        Write-Host ('Computer Name : {0}' -f $env:COMPUTERNAME)
-        Write-Host ('Current User  : {0}' -f $env:USERNAME)
-        Write-Host ('OS            : {0}' -f $os.Caption)
-        Write-Host ('Version       : {0}' -f $os.Version)
-        Write-Host ('Build         : {0}' -f $os.BuildNumber)
-        Write-Host ('Architecture  : {0}' -f $os.OSArchitecture)
-        Write-Host ('Manufacturer  : {0}' -f $computer.Manufacturer)
-        Write-Host ('Model         : {0}' -f $computer.Model)
-    }
-    catch {
-        Write-Host (
-            'Unable to retrieve system information: {0}' -f
-            $_.Exception.Message
-        ) -ForegroundColor Red
-    }
-
-    Write-Host ''
-}
-
-# ============================================================
-# MAIN MENU
-# ============================================================
 
 function Show-MainMenu {
     while ($true) {
         Clear-Host
-
         Write-Host ''
         Write-Host '============================================' -ForegroundColor Cyan
         Write-Host '       WINDOWS PROFILE MAINTENANCE' -ForegroundColor Cyan
         Write-Host ('                 v{0}' -f $ScriptVersion) -ForegroundColor Cyan
         Write-Host '============================================' -ForegroundColor Cyan
         Write-Host ''
-
-        Write-Host ('Administrator : {0}' -f (
-            [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        ))
+        Write-Host ('Administrator : {0}' -f ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name))
 
         if ($null -ne $script:LastAnalysis) {
-            Write-Host (
-                'Last Analysis : {0} ({1} GB)' -f
-                $script:LastAnalysis.Username,
-                $script:LastAnalysis.ProfileSizeGB
-            ) -ForegroundColor DarkGray
+            Write-Host ('Last Analysis : {0} ({1})' -f $script:LastAnalysis.Username, $script:LastAnalysis.ProfileSizeFormatted) -ForegroundColor DarkGray
         }
 
         Write-Host ''
-        Write-Host '[1] System Information'
-        Write-Host '[2] List User Profiles'
-        Write-Host '[3] Profile Details'
-        Write-Host '[4] Analyze Profile'
-        Write-Host '[5] Cleanup Dry Run'
-        Write-Host '[6] Export Last Analysis'
-        Write-Host '[7] Exit'
+        Write-Host '[1] List User Profiles'
+        Write-Host '[2] Analyze Profile'
+        Write-Host '[3] Cleanup Dry Run (Preview)'
+        Write-Host '[4] Execute Active Cleanup (Phase 3)'
+        Write-Host '[5] Export Last Analysis (JSON)'
+        Write-Host '[6] Exit'
         Write-Host ''
 
         $choice = Read-Host 'Select an option'
 
         switch ($choice) {
             '1' {
-                Show-SystemInformation
+                Clear-Host
+                Write-Host 'WINDOWS USER PROFILES' -ForegroundColor Cyan
+                $profiles = @(Get-WindowsUserProfiles)
+                foreach ($p in $profiles) {
+                    Write-Host ('User       : {0}' -f $p.Username)
+                    Write-Host ('Path       : {0}' -f $p.ProfilePath)
+                    Write-Host ('Size       : {0}' -f $p.SizeFormatted)
+                    Write-Host ('Management : {0}' -f $p.ManagementStatus)
+                    Write-Host '--------------------------------------------'
+                }
                 Read-Host 'Press Enter to continue'
             }
 
             '2' {
-                Clear-Host
-                Write-Host ''
-                Write-Host 'WINDOWS USER PROFILES' -ForegroundColor Cyan
-                Write-Host '============================================'
-                Write-Host ''
-
                 $profiles = @(Get-WindowsUserProfiles)
-
-                foreach ($profileEntry in $profiles) {
-                    $status = if ($profileEntry.Loaded) { 'LOADED' } else { 'Not Loaded' }
-
-                    Write-Host ('User          : {0}' -f $profileEntry.Username)
-                    Write-Host ('Path          : {0}' -f $profileEntry.ProfilePath)
-                    Write-Host ('SID           : {0}' -f $profileEntry.SID)
-                    Write-Host ('Size          : {0} GB' -f $profileEntry.SizeGB)
-                    Write-Host ('Status        : {0}' -f $status)
-                    Write-Host ('Management    : {0}' -f $profileEntry.ManagementStatus)
-                    Write-Host ('Scan Errors   : {0}' -f $profileEntry.ScanErrorCount)
-                    Write-Host '--------------------------------------------'
+                $selected = Select-Profile -Profiles $profiles
+                if ($null -ne $selected) {
+                    $analysis = Invoke-ProfileAnalysisV30 -ProfileInfo $selected
+                    if ($null -ne $analysis) { Show-ProfileAnalysisV30 -Analysis $analysis }
                 }
-
                 Read-Host 'Press Enter to continue'
             }
 
             '3' {
-                $profiles = @(Get-WindowsUserProfiles)
-                $selectedProfile = Select-Profile -Profiles $profiles
-
-                if ($null -ne $selectedProfile) {
-                    Clear-Host
-                    Write-Host ''
-                    Write-Host 'PROFILE DETAILS' -ForegroundColor Cyan
-                    Write-Host '============================================'
-                    Write-Host ''
-                    Write-Host ('Username          : {0}' -f $selectedProfile.Username)
-                    Write-Host ('SID               : {0}' -f $selectedProfile.SID)
-                    Write-Host ('Path              : {0}' -f $selectedProfile.ProfilePath)
-                    Write-Host ('Size              : {0} GB' -f $selectedProfile.SizeGB)
-                    Write-Host ('Files             : {0:N0}' -f $selectedProfile.FileCount)
-                    Write-Host ('Directories       : {0:N0}' -f $selectedProfile.DirectoryCount)
-                    Write-Host ('Scan Errors       : {0:N0}' -f $selectedProfile.ScanErrorCount)
-                    Write-Host ('Loaded            : {0}' -f $selectedProfile.Loaded)
-                    Write-Host ('Special           : {0}' -f $selectedProfile.Special)
-                    Write-Host ('Last Write        : {0}' -f $selectedProfile.LastWriteTime)
-                    Write-Host ('Management Status : {0}' -f $selectedProfile.ManagementStatus)
-                    Write-Host ('Management Reason : {0}' -f $selectedProfile.ManagementReason)
-                    Write-Host ('Can Manage        : {0}' -f $selectedProfile.CanManage)
-                    Write-Host ''
-                }
-
-                Read-Host 'Press Enter to continue'
-            }
-
-            '4' {
-                $profiles = @(Get-WindowsUserProfiles)
-                $selectedProfile = Select-Profile -Profiles $profiles
-
-                if ($null -ne $selectedProfile) {
-                    $analysis = Invoke-ProfileAnalysisV22 -ProfileInfo $selectedProfile
-
-                    if ($null -ne $analysis) {
-                        Show-ProfileAnalysisV22 -Analysis $analysis
-                    }
-                }
-
-                Read-Host 'Press Enter to continue'
-            }
-
-            '5' {
                 if ($null -eq $script:LastAnalysis) {
-                    Write-Host ''
                     Write-Host 'Run Analyze Profile first.' -ForegroundColor Yellow
                     Read-Host 'Press Enter to continue'
                     continue
                 }
-
-                Clear-Host
-                Write-Host ''
-                Write-Host 'CLEANUP DRY RUN' -ForegroundColor Cyan
-                Write-Host '=================================================='
-                Write-Host ''
-                Write-Host '[1] Light Cleanup Preview'
-                Write-Host '[2] Deep Cleanup Preview'
-                Write-Host '[Q] Cancel'
-                Write-Host ''
-
-                $dryRunChoice = Read-Host 'Select an option'
-
-                switch ($dryRunChoice) {
-                    '1' {
-                        Invoke-CleanupDryRun `
-                            -Analysis $script:LastAnalysis `
-                            -CleanupMode Light
-                        Read-Host 'Press Enter to continue'
-                    }
-
-                    '2' {
-                        Invoke-CleanupDryRun `
-                            -Analysis $script:LastAnalysis `
-                            -CleanupMode Deep
-                        Read-Host 'Press Enter to continue'
-                    }
-
-                    default {
-                        # Cancel
-                    }
-                }
-            }
-
-            '6' {
-                Export-LastAnalysis
+                Invoke-CleanupDryRun -Analysis $script:LastAnalysis -CleanupMode Deep
                 Read-Host 'Press Enter to continue'
             }
 
-            '7' {
-                Write-Log -Message 'Utility exited by administrator.'
-                return
+            '4' {
+                if ($null -eq $script:LastAnalysis) {
+                    Write-Host 'Run Analyze Profile first.' -ForegroundColor Yellow
+                    Read-Host 'Press Enter to continue'
+                    continue
+                }
+                Invoke-ProfileCleanup -Analysis $script:LastAnalysis -CleanupMode Deep
+                Read-Host 'Press Enter to continue'
             }
 
-            default {
-                Write-Host ''
-                Write-Host 'Invalid option.' -ForegroundColor Yellow
-                Start-Sleep -Seconds 1
+            '5' {
+                if ($null -ne $script:LastAnalysis) {
+                    $safeName = ($script:LastAnalysis.Username -replace '[\\/:*?"<>|]', '_')
+                    $filePath = Join-Path $ExportDirectory ('{0}_Analysis_{1}.json' -f $safeName, (Get-Date -Format 'yyyyMMdd_HHmmss'))
+                    $script:LastAnalysis | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $filePath -Encoding UTF8
+                    Write-Host ('Exported to: {0}' -f $filePath) -ForegroundColor Green
+                }
+                Read-Host 'Press Enter to continue'
             }
+
+            '6' { return }
         }
     }
 }
 
-# ============================================================
-# START
-# ============================================================
+Write-Log -Message ('Windows Profile Maintenance Utility v{0} started.' -f $ScriptVersion)
 
-Write-Log -Message (
-    'Windows Profile Maintenance Utility v{0} started.' -f
-    $ScriptVersion
-)
-
-try {
-    Show-MainMenu
-}
-catch {
-    Write-Log -Message (
-        'Unhandled error: {0}' -f $_.Exception.Message
-    ) -Level ERROR
-
-    Write-Host ''
-    Write-Host 'An unexpected error occurred.' -ForegroundColor Red
-    Write-Host ''
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    Write-Host ''
-    Read-Host 'Press Enter to exit'
-}
-finally {
-    Write-Log -Message 'Utility session ended.'
-}
+try { Show-MainMenu }
+finally { Write-Log -Message 'Utility session ended.' }
